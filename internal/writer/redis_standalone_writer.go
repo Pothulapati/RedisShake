@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"strconv"
 	"strings"
 	"sync"
@@ -28,16 +29,26 @@ type RedisWriterOptions struct {
 	Sentinel  client.SentinelOptions `mapstructure:"sentinel"`
 }
 
-type redisStandaloneWriter struct {
-	address string
-	client  *client.Redis
-	DbId    int
-
+type redisClient struct {
+	client *client.Redis
+	dbId   int // Track DB state per connection
+	// Per-connection reply channel
 	chWaitReply chan *entry.Entry
 	chWaitWg    sync.WaitGroup
-	offReply    bool
-	ch          chan *entry.Entry
-	chWg        sync.WaitGroup
+}
+
+type redisStandaloneWriter struct {
+	address string
+	// Pool of connections
+	clients []*redisClient
+	// Number of connections in the pool
+	numConnections int
+	// Channels for each connection to maintain order
+	cmdChannels []chan *entry.Entry
+
+	offReply bool
+	ch       chan *entry.Entry
+	chWg     sync.WaitGroup
 
 	stat struct {
 		Name              string `json:"name"`
@@ -46,37 +57,87 @@ type redisStandaloneWriter struct {
 	}
 }
 
+// getConnectionIndex returns consistent connection index for a given key
+func getConnectionIndex(key string, numConnections int) int {
+	h := fnv.New32a()
+	h.Write([]byte(key))
+	return int(h.Sum32()) % numConnections
+}
+
 func NewRedisStandaloneWriter(ctx context.Context, opts *RedisWriterOptions) Writer {
 	rw := new(redisStandaloneWriter)
 	rw.address = opts.Address
 	rw.stat.Name = "writer_" + strings.Replace(opts.Address, ":", "_", -1)
-	rw.client = client.NewRedisClient(ctx, opts.Address, opts.Username, opts.Password, opts.Tls, opts.TlsConfig, false)
+
+	// Initialize connection pool - use 8 connections
+	rw.numConnections = 8
+	rw.clients = make([]*redisClient, rw.numConnections)
+	rw.cmdChannels = make([]chan *entry.Entry, rw.numConnections)
+
+	for i := 0; i < rw.numConnections; i++ {
+		client := client.NewRedisClient(ctx, opts.Address, opts.Username, opts.Password, opts.Tls, opts.TlsConfig, false)
+		if opts.OffReply {
+			client.Send("CLIENT", "REPLY", "OFF")
+		}
+
+		rc := &redisClient{
+			client: client,
+			dbId:   0, // Start with DB 0
+		}
+
+		if !opts.OffReply {
+			rc.chWaitReply = make(chan *entry.Entry, config.Opt.Advanced.PipelineCountLimit)
+			rc.chWaitWg.Add(1)
+			go rw.processReply(rc)
+		}
+
+		rw.clients[i] = rc
+		// Create channel for each connection with standard buffer size
+		rw.cmdChannels[i] = make(chan *entry.Entry, config.Opt.Advanced.PipelineCountLimit)
+	}
+
 	rw.ch = make(chan *entry.Entry, config.Opt.Advanced.PipelineCountLimit)
 	if opts.OffReply {
 		log.Infof("turn off the reply of write")
 		rw.offReply = true
-		rw.client.Send("CLIENT", "REPLY", "OFF")
-	} else {
-		rw.chWaitReply = make(chan *entry.Entry, config.Opt.Advanced.PipelineCountLimit*2)
-		rw.chWaitWg.Add(1)
-		go rw.processReply()
 	}
 	return rw
 }
 
 func (w *redisStandaloneWriter) Close() {
+	close(w.ch)
+	w.chWg.Wait()
+
+	// Close all command channels
+	for _, ch := range w.cmdChannels {
+		close(ch)
+	}
+
+	// Close all reply channels and wait for processors
 	if !w.offReply {
-		close(w.ch)
-		w.chWg.Wait()
-		close(w.chWaitReply)
-		w.chWaitWg.Wait()
+		for _, c := range w.clients {
+			close(c.chWaitReply)
+			c.chWaitWg.Wait()
+		}
+	}
+
+	// Close all Redis connections
+	for _, c := range w.clients {
+		c.client.Close()
 	}
 }
 
 func (w *redisStandaloneWriter) StartWrite(ctx context.Context) chan *entry.Entry {
 	w.chWg = sync.WaitGroup{}
-	w.chWg.Add(1)
-	go w.processWrite(ctx)
+	w.chWg.Add(w.numConnections)
+
+	// Start the command distributor
+	go w.distributeCommands(ctx)
+
+	// Start processors for each connection
+	for i := 0; i < w.numConnections; i++ {
+		go w.processWrite(ctx, w.clients[i], w.cmdChannels[i])
+	}
 	return w.ch
 }
 
@@ -84,62 +145,93 @@ func (w *redisStandaloneWriter) Write(e *entry.Entry) {
 	w.ch <- e
 }
 
-func (w *redisStandaloneWriter) switchDbTo(newDbId int) {
-	log.Debugf("[%s] switch db to [%d]", w.stat.Name, newDbId)
-	w.client.Send("select", strconv.Itoa(newDbId))
-	w.DbId = newDbId
-	if !w.offReply {
-		w.chWaitReply <- &entry.Entry{
-			Argv:    []string{"select", strconv.Itoa(newDbId)},
-			CmdName: "select",
+// distributeCommands reads from main channel and routes to appropriate connection channel
+func (w *redisStandaloneWriter) distributeCommands(ctx context.Context) {
+	for {
+		select {
+		case e, ok := <-w.ch:
+			if !ok {
+				// Close all command channels when main channel is closed
+				for _, ch := range w.cmdChannels {
+					close(ch)
+				}
+				return
+			}
+			// Parse command to get keys if not already parsed
+			if len(e.Keys) == 0 {
+				e.Parse()
+			}
+
+			var connIndex int
+			if len(e.Keys) == 0 {
+				// Round-robin for commands without keys (like PING)
+				idx := atomic.AddInt64(&w.stat.UnansweredEntries, 1) % int64(w.numConnections)
+				connIndex = int(idx)
+			} else {
+				// Use the first key for routing to maintain order for multi-key operations
+				connIndex = getConnectionIndex(e.Keys[0], w.numConnections)
+			}
+
+			w.cmdChannels[connIndex] <- e
+
+		case <-ctx.Done():
+			// Context cancelled, clean up and exit
+			for _, ch := range w.cmdChannels {
+				close(ch)
+			}
+			return
 		}
 	}
 }
 
-func (w *redisStandaloneWriter) processWrite(ctx context.Context) {
+func (w *redisStandaloneWriter) processWrite(ctx context.Context, c *redisClient, cmdChan chan *entry.Entry) {
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
-			// do nothing until w.ch is closed
+			// do nothing until channel is closed
 		case <-ticker.C:
-			w.client.Flush()
-		case e, ok := <-w.ch:
+			c.client.Flush()
+		case e, ok := <-cmdChan:
 			if !ok {
 				// clean up and exit
-				w.client.Flush()
+				c.client.Flush()
 				w.chWg.Done()
 				return
 			}
-			// switch db if we need
-			if w.DbId != e.DbId {
-				w.switchDbTo(e.DbId)
+			// switch db if needed for this connection
+			if c.dbId != e.DbId {
+				log.Debugf("[%s] switch db to [%d]", w.stat.Name, e.DbId)
+				c.client.Send("select", strconv.Itoa(e.DbId))
+				if !w.offReply {
+					c.chWaitReply <- &entry.Entry{
+						Argv:    []string{"select", strconv.Itoa(e.DbId)},
+						CmdName: "select",
+					}
+				}
+				c.dbId = e.DbId
 			}
-			// send
+
+			// send using this connection
 			bytes := e.Serialize()
 			for e.SerializedSize+atomic.LoadInt64(&w.stat.UnansweredBytes) > config.Opt.Advanced.TargetRedisClientMaxQuerybufLen {
 				time.Sleep(1 * time.Nanosecond)
 			}
 			log.Debugf("[%s] send cmd. cmd=[%s]", w.stat.Name, e.String())
 			if !w.offReply {
-				select {
-				case w.chWaitReply <- e:
-				default:
-					w.client.Flush()
-					w.chWaitReply <- e
-				}
+				c.chWaitReply <- e
 				atomic.AddInt64(&w.stat.UnansweredBytes, e.SerializedSize)
 				atomic.AddInt64(&w.stat.UnansweredEntries, 1)
 			}
-			w.client.SendBytesBuff(bytes)
+			c.client.SendBytesBuff(bytes)
 		}
 	}
 }
 
-func (w *redisStandaloneWriter) processReply() {
-	for e := range w.chWaitReply {
-		reply, err := w.client.Receive()
+func (w *redisStandaloneWriter) processReply(c *redisClient) {
+	for e := range c.chWaitReply {
+		reply, err := c.client.Receive()
 		log.Debugf("[%s] receive reply. reply=[%v], cmd=[%s]", w.stat.Name, reply, e.String())
 
 		// It's good to skip the nil error since some write commands will return the null reply. For example,
@@ -155,13 +247,15 @@ func (w *redisStandaloneWriter) processReply() {
 				log.Panicf("[%s] receive reply failed. cmd=[%s], error=[%v]", w.stat.Name, e.String(), err)
 			}
 		}
+
 		if strings.EqualFold(e.CmdName, "select") { // skip select command
 			continue
 		}
+
 		atomic.AddInt64(&w.stat.UnansweredBytes, -e.SerializedSize)
 		atomic.AddInt64(&w.stat.UnansweredEntries, -1)
 	}
-	w.chWaitWg.Done()
+	c.chWaitWg.Done()
 }
 
 func (w *redisStandaloneWriter) Status() interface{} {
