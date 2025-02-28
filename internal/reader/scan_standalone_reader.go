@@ -50,6 +50,7 @@ type scanStandaloneReader struct {
 	needDumpQueue   *utils.UniqueQueue
 	needRestoreChan chan *needRestoreItem
 	dumpClient      *client.Redis
+	parent          *scanClusterReader // reference to parent cluster reader
 
 	stat struct {
 		Name              string `json:"name"`
@@ -232,6 +233,27 @@ func (r *scanStandaloneReader) restore() {
 		}
 		iDump, err1 := r.dumpClient.Receive()
 		iPttl, err2 := r.dumpClient.Receive()
+
+		// Handle MOVED error
+		if err1 != nil && strings.Contains(err1.Error(), "MOVED") {
+			if r.parent != nil {
+				// Extract new address from MOVED error
+				log.Infof("Got MOVED error: %v", err1)
+				parts := strings.Split(err1.Error(), " ")
+				if len(parts) >= 4 {
+					newAddress := parts[3]
+					// Find the reader responsible for the new address
+					if targetReader := r.parent.getReaderByAddress(newAddress); targetReader != nil {
+						targetReader.(*scanStandaloneReader).needDumpQueue.Put(dbKey{dbId, key})
+						log.Infof("Pushed key to target reader: %s", key)
+						continue
+					}
+				}
+			}
+			log.Warnf("Got MOVED error but couldn't handle it: %v", err1)
+			continue
+		}
+
 		if errors.Is(err1, proto.Nil) {
 			continue // key not exist
 		} else if err1 != nil {

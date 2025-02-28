@@ -9,20 +9,34 @@ import (
 )
 
 type scanClusterReader struct {
-	readers  []Reader
-	statusId int
+	readers          []Reader
+	statusId         int
+	readersByAddress map[string]Reader // map to quickly find readers by address
 }
 
 func NewScanClusterReader(ctx context.Context, opts *ScanReaderOptions) Reader {
 	addresses, _ := utils.GetRedisClusterNodes(ctx, opts.Address, opts.Username, opts.Password, opts.Tls, opts.TlsConfig, opts.PreferReplica)
 
-	rd := &scanClusterReader{}
+	rd := &scanClusterReader{
+		readersByAddress: make(map[string]Reader),
+	}
 	for _, address := range addresses {
 		theOpts := *opts
 		theOpts.Address = address
-		rd.readers = append(rd.readers, NewScanStandaloneReader(ctx, &theOpts))
+		reader := NewScanStandaloneReader(ctx, &theOpts)
+		rd.readers = append(rd.readers, reader)
+		rd.readersByAddress[address] = reader
+		// Set parent reference
+		if standaloneReader, ok := reader.(*scanStandaloneReader); ok {
+			standaloneReader.parent = rd
+		}
 	}
 	return rd
+}
+
+// getReaderByAddress returns the reader responsible for the given address
+func (rd *scanClusterReader) getReaderByAddress(address string) Reader {
+	return rd.readersByAddress[address]
 }
 
 func (rd *scanClusterReader) StartRead(ctx context.Context) []chan *entry.Entry {
