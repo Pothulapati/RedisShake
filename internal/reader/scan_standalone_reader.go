@@ -240,14 +240,16 @@ func (r *scanStandaloneReader) restore() {
 				// Extract new address from MOVED error
 				log.Infof("Got MOVED error: %v", err1)
 				parts := strings.Split(err1.Error(), " ")
-				if len(parts) >= 4 {
-					newAddress := parts[3]
+				if len(parts) == 3 {
+					newAddress := parts[2]
 					// Find the reader responsible for the new address
 					if targetReader := r.parent.getReaderByAddress(newAddress); targetReader != nil {
 						targetReader.(*scanStandaloneReader).needDumpQueue.Put(dbKey{dbId, key})
 						log.Infof("Pushed key to target reader: %s", key)
 						continue
 					}
+				} else {
+					log.Warnf("Couldn't parse address from MOVED error: %v", err1)
 				}
 			}
 			log.Warnf("Got MOVED error but couldn't handle it: %v", err1)
