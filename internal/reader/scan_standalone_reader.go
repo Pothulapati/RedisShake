@@ -247,6 +247,8 @@ func (r *scanStandaloneReader) restore() {
 						targetReader.(*scanStandaloneReader).needDumpQueue.Put(dbKey{dbId, key})
 						log.Infof("Pushed key to target reader: %s", key)
 						continue
+					} else {
+						log.Warnf("Couldn't find target reader for new address: %s", newAddress)
 					}
 				} else {
 					log.Warnf("Couldn't parse address from MOVED error: %v", err1)
